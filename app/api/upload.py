@@ -53,32 +53,47 @@ async def upload_document(
     log.info("upload.received", document_id=document_id,
              filename=file.filename, size_bytes=len(content))
 
-    # Assess quality before enhancement
-    quality = assess_quality(content)
-    log.info("upload.quality", document_id=document_id, **quality)
+    is_pdf = file.content_type == "application/pdf" or (file.filename or "").lower().endswith(".pdf")
 
-    if not quality["is_acceptable"] and quality["score"] < 10:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "OCR_CONFIDENCE_TOO_LOW",
-                "message": "तस्वीर की गुणवत्ता पर्याप्त नहीं है",
-                "message_en": "Image quality is too poor for text extraction",
-                "issues": quality["issues"],
-                "suggestions": [
-                    "Take photo in better lighting",
-                    "Hold phone steady to avoid blur",
-                    "Ensure all corners of document are visible"
-                ]
-            }
-        )
+    if is_pdf:
+        # For PDFs, skip image-based quality checks and enhancement.
+        quality = {
+            "blur_score": None,
+            "brightness": None,
+            "resolution": None,
+            "score": 100,
+            "is_acceptable": True,
+            "issues": ["pdf_quality_not_assessed"],
+        }
+        log.info("upload.quality", document_id=document_id, **quality)
+        enhanced = content
+    else:
+        # Assess quality before enhancement (images only)
+        quality = assess_quality(content)
+        log.info("upload.quality", document_id=document_id, **quality)
 
-    # Enhance image
-    try:
-        enhanced = enhance_image(content)
-    except Exception as e:
-        log.error("upload.enhance_failed", error=str(e))
-        enhanced = content  # Fall back to original
+        if not quality["is_acceptable"] and quality["score"] < 10:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "OCR_CONFIDENCE_TOO_LOW",
+                    "message": "तस्वीर की गुणवत्ता पर्याप्त नहीं है",
+                    "message_en": "Image quality is too poor for text extraction",
+                    "issues": quality["issues"],
+                    "suggestions": [
+                        "Take photo in better lighting",
+                        "Hold phone steady to avoid blur",
+                        "Ensure all corners of document are visible",
+                    ],
+                },
+            )
+
+        # Enhance image
+        try:
+            enhanced = enhance_image(content)
+        except Exception as e:
+            log.error("upload.enhance_failed", error=str(e))
+            enhanced = content  # Fall back to original
 
     # Run OCR
     ocr_result = extract_text(enhanced, filename=file.filename or "document.jpg", language=language)

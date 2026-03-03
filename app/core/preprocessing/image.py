@@ -137,7 +137,8 @@ def _safe_deskew(gray: np.ndarray) -> np.ndarray:
 
     angles = []
 
-    for rho, theta in lines[:20]:
+    for line in lines[:20]:
+        rho, theta = line[0]
         angle = (theta - np.pi / 2) * (180 / np.pi)
         angles.append(angle)
 

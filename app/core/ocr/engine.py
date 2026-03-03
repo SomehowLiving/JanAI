@@ -5,11 +5,15 @@ import unicodedata
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import threading
 
 import cv2
 import structlog
 
 log = structlog.get_logger()
+
+# Disable Paddle model connectivity/source checks (must be set before paddleocr import)
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 # Tunables
 CONFIDENCE_THRESHOLD = 0.7
@@ -22,6 +26,39 @@ LANG_MAP = {
     "en": "en",
     "auto": "en",
 }
+
+# Minimum chars to trust digital PDF text and skip raster OCR
+DIGITAL_TEXT_MIN_CHARS = 50
+
+
+_PADDLE_OCR_SINGLETONS: Dict[str, object] = {}
+_PADDLE_OCR_LOCK = threading.Lock()
+
+
+def _get_paddle_ocr(lang_code: str):
+    """
+    Lazy, per-process singleton for PaddleOCR.
+    Keeps model load out of request-path hot loop.
+    """
+    with _PADDLE_OCR_LOCK:
+        existing = _PADDLE_OCR_SINGLETONS.get(lang_code)
+        if existing is not None:
+            return existing
+
+        from paddleocr import PaddleOCR  # import after env var set at module import time
+
+        paddle_kwargs = {
+            "lang": lang_code,
+            "device": "cpu",
+            "enable_mkldnn": False,
+            "cpu_threads": 2,
+        }
+        if lang_code == "hi":
+            paddle_kwargs["text_recognition_model_name"] = "devanagari_PP-OCRv5_server_rec"
+
+        ocr = PaddleOCR(**paddle_kwargs)
+        _PADDLE_OCR_SINGLETONS[lang_code] = ocr
+        return ocr
 
 
 def _upscale_image(file_path: str):
@@ -78,11 +115,14 @@ def extract_text(image_bytes: bytes,
     try:
         lang_code = LANG_MAP.get(language.lower(), "en")
 
-        # 1) Preprocess: upscale small images for better small-font OCR
-        _upscale_image(tmp_path)
-
-        # 2) OCR (primary: PaddleOCR, fallback: EasyOCR)
-        ocr_result = _run_ocr_with_fallback(tmp_path, lang_code)
+        # If this is a PDF, use PDF-specific extraction flow
+        if suffix.lower() == ".pdf":
+            ocr_result = _run_pdf_ocr(tmp_path, lang_code)
+        else:
+            # 1) Preprocess: upscale small images for better small-font OCR
+            _upscale_image(tmp_path)
+            # 2) OCR (primary: PaddleOCR, fallback: EasyOCR)
+            ocr_result = _run_ocr_with_fallback(tmp_path, lang_code)
 
         if not ocr_result or not ocr_result.get("text"):
             return {
@@ -196,17 +236,146 @@ def _run_ocr_with_fallback(file_path: str, lang_code: str) -> Dict:
     return result or easy or {"text": "", "confidence": 0.0, "engine_used": "none", "blocks": []}
 
 
+def _run_pdf_ocr(file_path: str, lang_code: str) -> Dict:
+    """
+    End-to-end OCR pipeline for PDFs:
+    - Prefer digital text extraction per page
+    - Fallback to rasterization + image OCR when needed
+    Returns the same canonical dict as image OCR: {text, confidence, engine_used, blocks}.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:
+        log.exception("pdf.pymupdf_import_failed", error=str(e))
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "engine_used": "none",
+            "blocks": [],
+            "error_code": "PDF_DECODING_ERROR",
+            "error": str(e),
+        }
+
+    try:
+        doc = fitz.open(file_path)
+    except Exception as e:
+        log.exception("pdf.open_failed", error=str(e))
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "engine_used": "none",
+            "blocks": [],
+            "error_code": "PDF_DECODING_ERROR",
+            "error": str(e),
+        }
+
+    all_text_parts: List[str] = []
+    all_blocks: List[Dict] = []
+    weighted_conf_sum = 0.0
+    total_len = 0
+
+    try:
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            page_text = ""
+            page_conf = 0.0
+            page_blocks: List[Dict] = []
+
+            try:
+                raw_text = page.get_text("text") or ""
+                if raw_text and len(raw_text.strip()) >= DIGITAL_TEXT_MIN_CHARS:
+                    # Digital text path — authoritative, skip OCR
+                    page_text = raw_text
+                    page_conf = 0.99
+
+                    # Optional: get positional blocks
+                    try:
+                        blocks = page.get_text("blocks") or []
+                        for b in blocks:
+                            if len(b) >= 5:
+                                x0, y0, x1, y1, txt = b[:5]
+                                if not txt or not str(txt).strip():
+                                    continue
+                                page_blocks.append(
+                                    {
+                                        "text": str(txt),
+                                        "confidence": page_conf,
+                                        "bbox": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                                        "engine": "pdf_text_extraction",
+                                        "page": page_index,
+                                    }
+                                )
+                    except Exception:
+                        # If block extraction fails, fall back to plain text only
+                        pass
+                else:
+                    # Rasterization + image OCR path
+                    try:
+                        pix = page.get_pixmap(dpi=300, alpha=False)
+                    except Exception as e:
+                        log.exception("pdf.rasterize_failed", page=page_index, error=str(e))
+                        continue
+
+                    tmp_img = None
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as img_tmp:
+                            tmp_img = img_tmp.name
+                            pix.save(tmp_img)
+
+                        # Reuse image OCR pipeline (with language-aware cascade)
+                        img_result = _run_ocr_with_fallback(tmp_img, lang_code)
+                        page_text = img_result.get("text", "") or ""
+                        page_conf = float(img_result.get("confidence", 0.0) or 0.0)
+
+                        for blk in img_result.get("blocks", []):
+                            blk_copy = dict(blk)
+                            blk_copy["page"] = page_index
+                            page_blocks.append(blk_copy)
+                    finally:
+                        if tmp_img:
+                            try:
+                                os.unlink(tmp_img)
+                            except Exception:
+                                log.debug("pdf.temp_image_cleanup_failed", path=tmp_img)
+
+                if not page_text.strip():
+                    continue
+
+                all_text_parts.append(page_text)
+                all_blocks.extend(page_blocks)
+
+                page_len = len(page_text)
+                total_len += page_len
+                weighted_conf_sum += page_conf * page_len
+            except Exception as e:
+                log.exception("pdf.page_processing_failed", page=page_index, error=str(e))
+                continue
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+    if not all_text_parts:
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "engine_used": "none",
+            "blocks": [],
+            "error_code": "PDF_NO_TEXT",
+        }
+
+    doc_conf = weighted_conf_sum / total_len if total_len else 0.0
+    return {
+        "text": "\n\n".join(all_text_parts),
+        "confidence": max(0.0, min(1.0, doc_conf)),
+        "engine_used": "pdf_mixed",
+        "blocks": all_blocks,
+    }
+
 def _try_paddle(file_path: str, lang_code: str) -> Dict:
     try:
-        from paddleocr import PaddleOCR
-
-        # Let Paddle auto-select correct models for the language
-        ocr = PaddleOCR(
-            lang=lang_code,
-            device="cpu",
-            enable_mkldnn=False,
-            cpu_threads=2,
-        )
+        ocr = _get_paddle_ocr(lang_code)
 
         raw = ocr.ocr(file_path)
 
@@ -781,627 +950,3 @@ def _compute_confidence(ocr_conf: float, doc_score: float, validation_score: flo
     combined = 0.5 * ocr_conf + 0.2 * doc_score + 0.25 * validation_score + structured_bonus
     # clamp
     return max(0.0, min(1.0, combined))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # 3 TIER MODEL
-
-# import structlog
-# import os
-# from pathlib import Path
-# import tempfile
-# from typing import Dict, List, Optional
-# import numpy as np
-
-# # CRITICAL: Set BEFORE any paddle import
-# os.environ['FLAGS_use_mkldnn'] = '0'
-# os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
-
-# log = structlog.get_logger()
-
-# CONFIDENCE_THRESHOLD = 0.7
-# MIN_TEXT_LENGTH = 20  # Reject if less than 20 chars
-
-
-# def extract_text(image_bytes: bytes, filename: str = "document.jpg", 
-#                  doc_hint: Optional[str] = None) -> Dict:
-#     """
-#     3-tier OCR cascade: OpenBharat → PaddleOCR → EasyOCR
-    
-#     Args:
-#         image_bytes: Raw image bytes
-#         filename: Original filename (for extension)
-#         doc_hint: 'aadhaar', 'pan', 'passport', 'voter', 'driving', 'generic'
-    
-#     Returns:
-#         {
-#             "text": str,
-#             "confidence": float,  # 0-1
-#             "engine_used": str,
-#             "blocks": List[dict],
-#             "success": bool,
-#             "fallback_chain": List[str]  # Which engines were tried
-#         }
-#     """
-#     suffix = Path(filename).suffix or ".jpg"
-    
-#     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-#         tmp.write(image_bytes)
-#         tmp_path = tmp.name
-
-#     fallback_chain = []
-    
-#     try:
-#         # ========== TIER 1: OpenBharatOCR ==========
-#         log.info("ocr.tier1_start", engine="openbharatocr", hint=doc_hint)
-#         fallback_chain.append("openbharatocr")
-        
-#         result = _try_openbharat(tmp_path, doc_hint)
-        
-#         if _is_valid_result(result):
-#             log.info("ocr.tier1_success", 
-#                     confidence=result["confidence"],
-#                     text_length=len(result["text"]))
-#             result["success"] = True
-#             result["fallback_chain"] = fallback_chain
-#             return result
-        
-#         log.warning("ocr.tier1_failed", 
-#                    reason=_failure_reason(result),
-#                    confidence=result.get("confidence", 0))
-
-#         # ========== TIER 2: PaddleOCR (Safe Mode) ==========
-#         log.info("ocr.tier2_start", engine="paddleocr")
-#         fallback_chain.append("paddleocr")
-        
-#         result = _try_paddle_safe(tmp_path)
-        
-#         if _is_valid_result(result):
-#             log.info("ocr.tier2_success",
-#                     confidence=result["confidence"],
-#                     text_length=len(result["text"]))
-#             result["success"] = True
-#             result["fallback_chain"] = fallback_chain
-#             return result
-        
-#         log.warning("ocr.tier2_failed",
-#                    reason=_failure_reason(result),
-#                    error=result.get("error"))
-
-#         # ========== TIER 3: EasyOCR (Last Resort) ==========
-#         log.info("ocr.tier3_start", engine="easyocr")
-#         fallback_chain.append("easyocr")
-        
-#         result = _try_easyocr(tmp_path)
-        
-#         if _is_valid_result(result):
-#             log.info("ocr.tier3_success",
-#                     confidence=result["confidence"],
-#                     text_length=len(result["text"]))
-#             result["success"] = True
-#             result["fallback_chain"] = fallback_chain
-#             return result
-        
-#         log.error("ocr.total_failure", 
-#                  fallback_chain=fallback_chain,
-#                  last_error=result.get("error"))
-
-#         # Return failure but with metadata
-#         return {
-#             "text": "",
-#             "confidence": 0.0,
-#             "engine_used": "none",
-#             "blocks": [],
-#             "success": False,
-#             "fallback_chain": fallback_chain,
-#             "error": "All OCR engines failed. Please upload a clearer image.",
-#             "suggestions": [
-#                 "Ensure good lighting (avoid shadows)",
-#                 "Keep camera steady and parallel to document",
-#                 "Make sure all text is clearly visible",
-#                 "Try with a white background"
-#             ]
-#         }
-
-#     finally:
-#         try:
-#             os.unlink(tmp_path)
-#         except Exception as e:
-#             log.warning("temp_file_cleanup_failed", error=str(e))
-
-
-# def _is_valid_result(result: Dict) -> bool:
-#     """Validate OCR result quality"""
-#     if not result or not result.get("text"):
-#         return False
-    
-#     text = result["text"].strip()
-#     confidence = result.get("confidence", 0)
-    
-#     checks = [
-#         len(text) >= MIN_TEXT_LENGTH,           # Minimum content
-#         confidence >= 0.3,                         # Not completely garbage
-#         len(text.split()) >= 3,                   # At least 3 words
-#         not _is_garbage_text(text)                # Not random characters
-#     ]
-    
-#     return all(checks)
-
-
-# def _is_garbage_text(text: str) -> bool:
-#     """Detect garbage OCR output"""
-#     if not text:
-#         return True
-    
-#     # Check for excessive non-alphanumeric characters
-#     import re
-#     alphanumeric_ratio = len(re.sub(r'[^a-zA-Z0-9\s]', '', text)) / len(text)
-    
-#     # Check for repeated characters (common OCR artifact)
-#     repeated_pattern = re.search(r'(.)\1{10,}', text)  # Same char 10+ times
-    
-#     return alphanumeric_ratio < 0.5 or repeated_pattern is not None
-
-
-# def _failure_reason(result: Dict) -> str:
-#     """Human-readable failure reason"""
-#     if not result or not result.get("text"):
-#         return "no_text_extracted"
-#     if len(result.get("text", "")) < MIN_TEXT_LENGTH:
-#         return "text_too_short"
-#     if result.get("confidence", 0) < 0.3:
-#         return "low_confidence"
-#     return "unknown"
-
-# def _try_openbharat(file_path: str, doc_hint: Optional[str] = None) -> Dict:
-#     """
-#     Try all OpenBharatOCR document types
-#     """
-#     import openbharatocr
-    
-#     # CORRECT: Functions are at package level, not in submodules
-#     doc_types = {
-#         'aadhaar_front': openbharatocr.front_aadhaar,
-#         'aadhaar_back': openbharatocr.back_aadhaar,
-#         'pan': openbharatocr.pan,
-#         'passport': openbharatocr.passport,
-#         'voter_front': openbharatocr.voter_id_front,
-#         'voter_back': openbharatocr.voter_id_back,
-#         'driving': openbharatocr.driving_licence,
-#         'birth_certificate': openbharatocr.birth_certificate,
-#         'degree': openbharatocr.degree,
-#         'vehicle': openbharatocr.vehicle_registration,
-#         'water_bill': openbharatocr.water_bill,
-#     }
-    
-#     # Map generic hints to specific functions
-#     hint_mapping = {
-#         'aadhaar': ['aadhaar_front', 'aadhaar_back'],
-#         'voter': ['voter_front', 'voter_back'],
-#     }
-    
-#     # If hint provided, try mapped functions first
-#     if doc_hint in hint_mapping:
-#         for specific_hint in hint_mapping[doc_hint]:
-#             if specific_hint in doc_types:
-#                 try:
-#                     log.debug("openbharat.trying_hint", hint=specific_hint)
-#                     raw = doc_types[specific_hint](file_path)
-#                     result = _normalize_openbharat_result(raw, specific_hint)
-#                     if _is_valid_result(result):
-#                         return result
-#                 except Exception as e:
-#                     log.warning("openbharat.hint_failed", hint=specific_hint, error=str(e))
-    
-#     # Try all document types, pick best result
-#     all_results = []
-#     for doc_type, func in doc_types.items():
-#         try:
-#             log.debug("openbharat.trying", doc_type=doc_type)
-#             raw = func(file_path)
-#             result = _normalize_openbharat_result(raw, doc_type)
-#             if _is_valid_result(result):
-#                 all_results.append((result, len(result["text"]), result["confidence"]))
-#                 log.info("openbharat.success", doc_type=doc_type, text_length=len(result["text"]))
-#             else:
-#                 log.debug("openbharat.invalid_result", doc_type=doc_type)
-#         except Exception as e:
-#             log.debug("openbharat.type_failed", type=doc_type, error=str(e))
-#             continue
-    
-#     if all_results:
-#         # Pick result with highest (text_length * confidence) score
-#         best = max(all_results, key=lambda x: x[1] * x[2])[0]
-#         log.info("openbharat.best_selected", 
-#                 doc_type=best.get("doc_type"),
-#                 text_length=len(best["text"]),
-#                 confidence=best["confidence"])
-#         return best
-    
-#     # No valid results from any type
-#     log.warning("openbharat.no_valid_results", tried=list(doc_types.keys()))
-#     return {"text": "", "confidence": 0.0, "engine_used": "openbharatocr", "blocks": []}
-
-# def _normalize_openbharat_result(raw: Dict, doc_type: str) -> Dict:
-#     """
-#     Normalize OpenBharatOCR output to standard format
-#     """
-#     if not raw or not isinstance(raw, dict):
-#         return {"text": "", "confidence": 0.0, "engine_used": "openbharatocr", "blocks": []}
-    
-#     # Extract all text fields into readable format
-#     all_text = []
-#     blocks = []
-    
-#     for field_name, field_value in raw.items():
-#         if field_value and isinstance(field_value, str) and field_value.strip():
-#             all_text.append(f"{field_name}: {field_value}")
-#             blocks.append({
-#                 "field": field_name,
-#                 "text": field_value,
-#                 "confidence": 0.9,  # OpenBharat doesn't give confidence, estimate high
-#                 "type": doc_type
-#             })
-#         elif field_value and isinstance(field_value, list):
-#             # Handle list values (e.g., multiple dates)
-#             for item in field_value:
-#                 if item and str(item).strip():
-#                     all_text.append(f"{field_name}: {item}")
-#                     blocks.append({
-#                         "field": field_name,
-#                         "text": str(item),
-#                         "confidence": 0.85,
-#                         "type": doc_type
-#                     })
-    
-#     # Calculate pseudo-confidence based on field coverage
-#     # More fields extracted = higher confidence
-#     expected_fields = {
-#         'aadhaar_front': ['name', 'aadhaar_number', 'dob', 'gender'],
-#         'aadhaar_back': ['address', 'fathers_name'],
-#         'pan': ['name', 'pan_number', 'dob', 'fathers_name'],
-#         'passport': ['name', 'passport_number', 'nationality', 'dob'],
-#         'voter_front': ['name', 'epic_number', 'dob', 'fathers_name'],
-#         'voter_back': ['address'],
-#         'driving': ['name', 'dl_number', 'address', 'validity_dates'],
-#     }
-    
-#     if doc_type in expected_fields:
-#         required = expected_fields[doc_type]
-#         found = sum(1 for f in required if raw.get(f))
-#         confidence = 0.5 + (0.5 * found / len(required))  # 0.5 to 1.0
-#     else:
-#         confidence = 0.7 if all_text else 0.0
-    
-#     return {
-#         "text": "\n".join(all_text),
-#         "confidence": confidence,
-#         "engine_used": "openbharatocr",
-#         "blocks": blocks,
-#         "structured_fields": raw,
-#         "doc_type": doc_type
-#     }
-    
-    
-# def _try_paddle_safe(file_path: str) -> Dict:
-#     """
-#     PaddleOCR with crash prevention
-#     """
-#     try:
-#         from paddleocr import PaddleOCR
-        
-#         # Initialize fresh instance each time (slower but safer)
-#         ocr = PaddleOCR(
-#             use_angle_cls=True,
-#             lang='en',  # Use 'hi' for Hindi-focused, 'ch' for Chinese
-#             use_gpu=False,
-#             enable_mkldnn=False,  # CRITICAL: Prevents your crash
-#             cpu_threads=2,  # Limit threads for stability
-#             show_log=False,
-#             use_dilation=True,  # Better for text close to edges
-#             det_db_score_mode='fast'  # Speed/accuracy balance
-#         )
-        
-#         result = ocr.ocr(file_path, cls=True)
-        
-#         if not result or not result[0]:
-#             return {"text": "", "confidence": 0.0, "engine_used": "paddleocr", "blocks": []}
-        
-#         lines = result[0]
-#         blocks = []
-#         all_text = []
-#         confidences = []
-        
-#         for line in lines:
-#             bbox, (text, conf) = line[0], line[1]
-#             if text and text.strip():
-#                 blocks.append({
-#                     "text": text,
-#                     "confidence": float(conf) / 100,  # Normalize to 0-1
-#                     "bbox": bbox,
-#                     "engine": "paddleocr"
-#                 })
-#                 all_text.append(text)
-#                 confidences.append(float(conf) / 100)
-        
-#         avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-        
-#         return {
-#             "text": "\n".join(all_text),
-#             "confidence": avg_confidence,
-#             "engine_used": "paddleocr",
-#             "blocks": blocks
-#         }
-        
-#     except Exception as e:
-#         log.error("paddleocr.exception", error=str(e), error_type=type(e).__name__)
-#         return {
-#             "text": "", 
-#             "confidence": 0.0, 
-#             "engine_used": "paddleocr",
-#             "blocks": [],
-#             "error": str(e)
-#         }
-
-
-# def _try_easyocr(file_path: str) -> Dict:
-#     """
-#     EasyOCR as last resort — initialize once if possible
-#     """
-#     try:
-#         import easyocr
-        
-#         # Use class-level cache to avoid reloading model every time
-#         if not hasattr(_try_easyocr, 'reader'):
-#             log.info("easyocr.initializing")
-#             _try_easyocr.reader = easyocr.Reader(
-#                 ['en', 'hi'],  # English + Hindi
-#                 gpu=False,
-#                 model_storage_directory='./models',
-#                 download_enabled=True
-#             )
-        
-#         raw = _try_easyocr.reader.readtext(file_path)
-        
-#         if not raw:
-#             return {"text": "", "confidence": 0.0, "engine_used": "easyocr", "blocks": []}
-        
-#         blocks = []
-#         all_text = []
-#         confidences = []
-        
-#         for (bbox, text, conf) in raw:
-#             if text and text.strip():
-#                 blocks.append({
-#                     "text": text,
-#                     "confidence": float(conf),
-#                     "bbox": str(bbox),
-#                     "engine": "easyocr"
-#                 })
-#                 all_text.append(text)
-#                 confidences.append(float(conf))
-        
-#         avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-        
-#         # EasyOCR confidence is often inflated, adjust down
-#         adjusted_confidence = avg_confidence * 0.9
-        
-#         return {
-#             "text": "\n".join(all_text),
-#             "confidence": adjusted_confidence,
-#             "engine_used": "easyocr",
-#             "blocks": blocks
-#         }
-        
-#     except Exception as e:
-#         log.error("easyocr.exception", error=str(e))
-#         return {
-#             "text": "", 
-#             "confidence": 0.0, 
-#             "engine_used": "easyocr",
-#             "blocks": [],
-#             "error": str(e)
-#         }
-
-
-
-
-
-
-
-
-
-# working but just 2 tier 
-
-# import structlog
-# from openbharatocr import ocr as bharat_ocr
-# from pathlib import Path
-# import tempfile, os
-
-# log = structlog.get_logger()
-
-# CONFIDENCE_THRESHOLD = 0.7
-
-
-# def extract_text(image_bytes: bytes, filename: str = "document.jpg") -> dict:
-#     """
-#     Primary OCR using OpenBharatOCR.
-#     Falls back to PaddleOCR if confidence < threshold.
-    
-#     Returns:
-#         {
-#             "text": str,
-#             "confidence": float,
-#             "engine_used": str,
-#             "blocks": list
-#         }
-#     """
-#     # Write bytes to temp file (OpenBharatOCR needs file path)
-#     suffix = Path(filename).suffix or ".jpg"
-#     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-#         tmp.write(image_bytes)
-#         tmp_path = tmp.name
-
-#     try:
-#         log.info("ocr.start", engine="openbharatocr", file=filename)
-#         result = _run_openbharat(tmp_path)
-
-#         if result["confidence"] >= CONFIDENCE_THRESHOLD:
-#             log.info("ocr.complete", engine="openbharatocr",
-#                      confidence=result["confidence"])
-#             return result
-
-#         # Confidence too low — try PaddleOCR
-#         log.warning("ocr.low_confidence", confidence=result["confidence"],
-#                     threshold=CONFIDENCE_THRESHOLD, fallback="paddleocr")
-#         paddle_result = _run_paddle(tmp_path)
-
-#         # Return whichever got higher confidence
-#         if paddle_result["confidence"] > result["confidence"]:
-#             log.info("ocr.fallback_better", engine="paddleocr",
-#                      confidence=paddle_result["confidence"])
-#             return paddle_result
-
-#         return result
-
-#     finally:
-#         os.unlink(tmp_path)  # Always clean up temp file
-
-
-# def _run_openbharat(file_path: str) -> dict:
-#     """Run OpenBharatOCR and normalize output."""
-#     try:
-#         from openbharatocr.ocr import aadhaar, pan, passport
-#         from PIL import Image
-        
-#         # Try PAN card extraction first
-#         try:
-#             raw = pan(file_path)
-#         except:
-#             raw = {}
-
-#         all_text = []
-#         blocks = []
-#         for field_name, field_value in raw.items():
-#             if field_value and isinstance(field_value, str) and field_value.strip():
-#                 all_text.append(f"{field_name}: {field_value}")
-#                 blocks.append({
-#                     "field": field_name,
-#                     "text": field_value,
-#                     "confidence": 0.9
-#                 })
-
-#         if not blocks:
-#             # Fall through to PaddleOCR
-#             return {"text": "", "confidence": 0.0, "engine_used": "openbharatocr",
-#                     "blocks": [], "structured_fields": {}}
-
-#         return {
-#             "text": "\n".join(all_text),
-#             "confidence": 0.9,
-#             "engine_used": "openbharatocr",
-#             "blocks": blocks,
-#             "structured_fields": raw
-#         }
-
-#     except Exception as e:
-#         log.error("ocr.openbharat_failed", error=str(e))
-#         return {"text": "", "confidence": 0.0, "engine_used": "openbharatocr",
-#                 "blocks": [], "error": str(e)}
-
-# def _run_paddle(file_path: str) -> dict:
-#     """Fallback OCR using EasyOCR (replacing PaddleOCR due to compatibility issues)."""
-#     try:
-#         import easyocr
-#         reader = easyocr.Reader(['en', 'hi'], gpu=False)
-#         raw = reader.readtext(file_path)
-
-#         blocks = []
-#         all_text = []
-#         total_confidence = 0.0
-
-#         for (bbox, text, conf) in raw:
-#             if text.strip():
-#                 blocks.append({
-#                     "text": text,
-#                     "confidence": float(conf),
-#                     "bbox": str(bbox)
-#                 })
-#                 all_text.append(text)
-#                 total_confidence += float(conf)
-
-#         avg_confidence = total_confidence / len(blocks) if blocks else 0.0
-
-#         return {
-#             "text": "\n".join(all_text),
-#             "confidence": avg_confidence,
-#             "engine_used": "easyocr",
-#             "blocks": blocks
-#         }
-
-#     except Exception as e:
-#         log.error("ocr.easyocr_failed", error=str(e))
-#         return {"text": "", "confidence": 0.0, "engine_used": "easyocr",
-#                 "blocks": [], "error": str(e)}
-        
-        
-        
-
-# def _run_paddle(file_path: str) -> dict:
-#     """Run PaddleOCR and normalize output."""
-#     try:
-#         # Disable PIR (Parallel Intermediate Representation) to avoid
-#         # Unimplemented errors with PaddlePaddle 3.x
-#         import paddle
-#         paddle.set_flags({'FLAGS_enable_pir_api': False, 'FLAGS_enable_pir_in_executor': False})
-        
-#         from paddleocr import PaddleOCR
-#         paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-#         raw = paddle_ocr.predict(file_path)
-        
-#         blocks = []
-#         all_text = []
-#         total_confidence = 0.0
-
-#         if raw:
-#             for result in raw:
-#                 # PaddleOCR 3.x returns result differently
-#                 rec_texts = result.get('rec_texts', [])
-#                 rec_scores = result.get('rec_scores', [])
-                
-#                 for text, conf in zip(rec_texts, rec_scores):
-#                     if text.strip():
-#                         blocks.append({
-#                             "text": text,
-#                             "confidence": float(conf),
-#                         })
-#                         all_text.append(text)
-#                         total_confidence += float(conf)
-
-#         avg_confidence = total_confidence / len(blocks) if blocks else 0.0
-
-#         return {
-#             "text": "\n".join(all_text),
-#             "confidence": avg_confidence,
-#             "engine_used": "paddleocr",
-#             "blocks": blocks
-#         }
-
-#     except Exception as e:
-#         log.error("ocr.paddle_failed", error=str(e))
-#         return {"text": "", "confidence": 0.0, "engine_used": "paddleocr",
-#                 "blocks": [], "error": str(e)}
